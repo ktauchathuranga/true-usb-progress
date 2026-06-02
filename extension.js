@@ -7,8 +7,9 @@
  *
  * Architecture:
  *  • UDisks2 D-Bus → discover which block devices are removable + mounted
- *  • /proc/meminfo  → system-wide Dirty + Writeback kB
- *  • /sys/block/<dev>/stat → per-device in-flight I/O sectors
+ *  • /sys/block/<dev>/stat → per-device write sectors & I/O request counts
+ *  • Delta tracking + threshold heuristics → ignore metadata writes,
+ *    only trigger on real file copy/move operations
  *  • GLib.timeout_add_seconds → 2-second polling loop
  *  • PanelMenu.Button → hidden when idle, visible when writing
  *
@@ -27,8 +28,21 @@ import * as PanelMenu  from 'resource:///org/gnome/shell/ui/panelMenu.js';
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const POLL_INTERVAL_SECONDS = 2;
-const DIRTY_THRESHOLD_KB    = 512;   // ignore noise below this
 const NOTIFY_COOLDOWN_MS    = 10_000; // min gap between "safe to eject" toasts
+
+// ── Write-detection thresholds ───────────────────────────────────────────────
+// Metadata writes (journal commits, inode updates, directory entries) are small
+// and infrequent.  Real file copies produce large sustained throughput.
+// We use two criteria to tell them apart:
+//   1. Minimum write rate per tick (bytes written since last poll)
+//   2. Minimum average I/O request size (large = sequential file data)
+const MIN_WRITE_RATE_BYTES  = 64 * 1024;  // 64 KB per tick (~32 KB/s @2s poll)
+const MIN_AVG_IO_SIZE_BYTES = 16 * 1024;  // 16 KB avg request size
+
+// Once a real write burst is detected, keep the indicator visible for this many
+// consecutive "quiet" ticks before declaring the write finished.  This avoids
+// flicker caused by short pauses between bursts (e.g. between files).
+const QUIET_TICKS_BEFORE_DONE = 3;
 
 // UDisks2 well-known names
 const UDISKS2_BUS_NAME  = 'org.freedesktop.UDisks2';
@@ -57,38 +71,58 @@ function readFileSync(path) {
 }
 
 /**
- * Parse /proc/meminfo and return { dirty_kb, writeback_kb }.
- * @returns {{ dirty_kb: number, writeback_kb: number }}
+ * Strip the partition suffix from a device name to get the parent disk.
+ * UDisks2 reports partition names (e.g. "sda1") but /sys/block/ only
+ * contains whole-disk entries (e.g. "sda").
+ *
+ * Handles:
+ *   "sda1"       → "sda"
+ *   "nvme0n1p1"  → "nvme0n1"
+ *   "sda"        → "sda"   (already a whole disk)
+ *
+ * @param {string} devName
+ * @returns {string}
  */
-function parseProcMeminfo() {
-    const text = readFileSync('/proc/meminfo');
-    if (!text) return { dirty_kb: 0, writeback_kb: 0 };
+function toParentDisk(devName) {
+    // NVMe: nvme0n1p1 → nvme0n1  (strip the trailing pN)
+    const nvmeMatch = devName.match(/^(nvme\d+n\d+)p\d+$/);
+    if (nvmeMatch) return nvmeMatch[1];
 
-    let dirty_kb    = 0;
-    let writeback_kb = 0;
+    // SCSI / USB: sda1 → sda, sdb2 → sdb  (strip trailing digits)
+    const sdMatch = devName.match(/^(sd[a-z]+)\d+$/);
+    if (sdMatch) return sdMatch[1];
 
-    for (const line of text.split('\n')) {
-        if (line.startsWith('Dirty:'))
-            dirty_kb    = parseInt(line.split(/\s+/)[1], 10) || 0;
-        else if (line.startsWith('Writeback:'))
-            writeback_kb = parseInt(line.split(/\s+/)[1], 10) || 0;
-    }
-    return { dirty_kb, writeback_kb };
+    // mmcblk: mmcblk0p1 → mmcblk0
+    const mmcMatch = devName.match(/^(mmcblk\d+)p\d+$/);
+    if (mmcMatch) return mmcMatch[1];
+
+    return devName; // already a whole-disk name
 }
 
 /**
- * Parse /sys/block/<dev>/stat and return the number of I/O operations
- * currently in-flight (field 9, 0-indexed).
- * Stat fields: https://www.kernel.org/doc/Documentation/block/stat.txt
- * @param {string} devName  e.g. "sdb"
- * @returns {number}
+ * Parse /sys/block/<dev>/stat and return write-related counters.
+ * Stat fields (0-indexed): https://www.kernel.org/doc/Documentation/block/stat.txt
+ *   4 — writes completed
+ *   5 — writes merged
+ *   6 — sectors written  (each sector = 512 bytes)
+ *   8 — I/Os currently in progress
+ *
+ * Automatically resolves partition names (e.g. "sda1") to the parent disk
+ * ("sda") since /sys/block/ only has whole-disk entries.
+ *
+ * @param {string} devName  e.g. "sdb1" or "sdb"
+ * @returns {{ writesCompleted: number, sectorsWritten: number, inFlight: number }}
  */
-function getBlockInFlight(devName) {
-    const text = readFileSync(`/sys/block/${devName}/stat`);
-    if (!text) return 0;
-    const fields = text.trim().split(/\s+/);
-    // field index 8 = ios_in_progress (1-based column 9)
-    return parseInt(fields[8], 10) || 0;
+function getBlockWriteStats(devName) {
+    const disk = toParentDisk(devName);
+    const text = readFileSync(`/sys/block/${disk}/stat`);
+    if (!text) return { writesCompleted: 0, sectorsWritten: 0, inFlight: 0 };
+    const f = text.trim().split(/\s+/);
+    return {
+        writesCompleted : parseInt(f[4], 10) || 0,
+        sectorsWritten  : parseInt(f[6], 10) || 0,
+        inFlight        : parseInt(f[8], 10) || 0,
+    };
 }
 
 /**
@@ -126,6 +160,11 @@ export default class TrueUsbProgressExtension extends Extension {
         this._udisksSignalIds  = [];
         this._dbusConnection   = null;
 
+        // Per-device state for delta tracking
+        // Map<devName, { prevWrites, prevSectors, totalBytesThisBurst }>
+        this._devStats         = new Map();
+        this._quietTicks       = 0;   // how many consecutive ticks with no real writes
+
         this._buildIndicator();
         this._connectUDisks2();
         this._startPolling();
@@ -137,6 +176,7 @@ export default class TrueUsbProgressExtension extends Extension {
         this._destroyIndicator();
 
         this._removableDevices = null;
+        this._devStats         = null;
     }
 
     // ── Indicator (PanelMenu.Button) ───────────────────────────────────────
@@ -330,50 +370,120 @@ export default class TrueUsbProgressExtension extends Extension {
 
     /**
      * Called every POLL_INTERVAL_SECONDS.
-     * Combines system dirty-cache data with per-device in-flight I/O to decide
-     * whether USB writes are currently active.
+     *
+     * Uses per-device sector-write deltas from /sys/block/<dev>/stat to detect
+     * real file writes while ignoring small metadata bursts (journal commits,
+     * inode updates, directory entry changes).
+     *
+     * Detection heuristic:
+     *   1. Compute ΔsectorsWritten and ΔwritesCompleted since last tick
+     *   2. Convert to bytes (sectors × 512)
+     *   3. Only flag as "writing" if:
+     *        • ΔBytes  ≥  MIN_WRITE_RATE_BYTES   (sustained throughput)
+     *        • avgIO   ≥  MIN_AVG_IO_SIZE_BYTES   (large sequential writes)
+     *   4. Use a quiet-tick counter to ride through brief pauses between files
      */
     _tick() {
         if (!this._indicator) return;                  // extension disabled mid-tick
 
-        // ── 1. System dirty cache ──────────────────────────────────────────
-        const { dirty_kb, writeback_kb } = parseProcMeminfo();
-        const totalDirty_kb = dirty_kb + writeback_kb;
+        const hasRemovable = this._removableDevices.size > 0;
+        if (!hasRemovable) {
+            this._indicator.hide();
+            return;
+        }
 
-        // ── 2. Per-device in-flight I/O ────────────────────────────────────
-        let anyInFlight = false;
+        // ── 1. Per-device delta analysis ───────────────────────────────────
+        let totalDeltaBytes = 0;
+        let anyRealWrite    = false;
+        let anyInFlight     = false;
+
         for (const dev of this._removableDevices) {
-            if (getBlockInFlight(dev) > 0) {
-                anyInFlight = true;
-                break;
+            const stats = getBlockWriteStats(dev);
+            const prev  = this._devStats.get(dev);
+
+            if (stats.inFlight > 0) anyInFlight = true;
+
+            if (!prev) {
+                // First time seeing this device — store baseline, skip delta
+                this._devStats.set(dev, {
+                    prevWrites         : stats.writesCompleted,
+                    prevSectors        : stats.sectorsWritten,
+                    totalBytesThisBurst: 0,
+                });
+                continue;
+            }
+
+            const deltaWrites  = stats.writesCompleted - prev.prevWrites;
+            const deltaSectors = stats.sectorsWritten  - prev.prevSectors;
+            const deltaBytes   = deltaSectors * 512;
+
+            // Update stored state
+            prev.prevWrites  = stats.writesCompleted;
+            prev.prevSectors = stats.sectorsWritten;
+
+            if (deltaWrites <= 0 || deltaSectors <= 0) continue;
+
+            const avgIOSize = deltaBytes / deltaWrites;
+
+            // Only consider this a real file write if it exceeds both thresholds
+            if (deltaBytes >= MIN_WRITE_RATE_BYTES &&
+                avgIOSize  >= MIN_AVG_IO_SIZE_BYTES) {
+                anyRealWrite = true;
+                prev.totalBytesThisBurst += deltaBytes;
+                totalDeltaBytes          += deltaBytes;
             }
         }
 
-        // ── 3. Decide write state ──────────────────────────────────────────
-        // We consider a write "active" if:
-        //   • there is non-trivial dirty data in the page cache  AND
-        //   • at least one tracked removable device has in-flight I/O
+        // ── 2. Decide write state with quiet-tick hysteresis ───────────────
         //
-        // We stay in "writing" state as long as dirty cache remains above the
-        // threshold OR in-flight I/O is still happening (handles the small
-        // window where dirty_kb already drained but I/O hasn't completed).
-        const hasRemovable = this._removableDevices.size > 0;
-        const isWriting    = hasRemovable && (
-            (totalDirty_kb > DIRTY_THRESHOLD_KB) || anyInFlight
-        );
+        // If a real write is happening right now → reset quiet counter.
+        // If no real write this tick but we were previously writing, increment
+        // the quiet counter.  Only declare "done" after several consecutive
+        // quiet ticks (avoids flicker between files in a batch copy).
+        // Also stay active if there are still in-flight I/Os on the device.
 
-        // ── 4. Update indicator ────────────────────────────────────────────
+        let isWriting;
+        if (anyRealWrite) {
+            this._quietTicks = 0;
+            isWriting = true;
+        } else if (this._wasWriting && (anyInFlight || this._quietTicks < QUIET_TICKS_BEFORE_DONE)) {
+            this._quietTicks++;
+            isWriting = true;
+        } else {
+            isWriting = false;
+        }
+
+        // ── 3. Update indicator ────────────────────────────────────────────
         if (isWriting) {
-            const mb = (totalDirty_kb / 1024).toFixed(1);
-            this._label.set_text(`Writing: ${mb} MB`);
+            // Sum up total bytes written across all tracked devices in this burst
+            let burstTotal = 0;
+            for (const [, st] of this._devStats) {
+                burstTotal += st.totalBytesThisBurst;
+            }
+
+            const writtenMB = (burstTotal / (1024 * 1024)).toFixed(1);
+            const rateMBs   = (totalDeltaBytes / (1024 * 1024) / POLL_INTERVAL_SECONDS).toFixed(1);
+
+            if (totalDeltaBytes > 0) {
+                this._label.set_text(`Writing: ${writtenMB} MB (${rateMBs} MB/s)`);
+            } else {
+                // In the quiet tail / flushing phase
+                this._label.set_text(`Flushing: ${writtenMB} MB written`);
+            }
+
             this._indicator.show();
             this._wasWriting = true;
         } else {
             this._indicator.hide();
 
             // Emit "safe to eject" notification once per completed write burst
-            if (this._wasWriting && hasRemovable) {
+            if (this._wasWriting) {
                 this._wasWriting = false;
+                this._quietTicks = 0;
+                // Reset burst counters
+                for (const [, st] of this._devStats) {
+                    st.totalBytesThisBurst = 0;
+                }
                 this._notifySyncComplete();
             }
         }
