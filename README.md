@@ -2,6 +2,8 @@
 
 A GNOME Shell extension that monitors real-time kernel dirty-cache writes destined for removable USB block devices. It displays a top-bar indicator with live write speed and total bytes transferred, and notifies you when the flush is complete so you know exactly when a drive is safe to eject.
 
+[![GNOME Extensions](https://img.shields.io/badge/GNOME_Extensions-Install-4A86CF?logo=gnome&logoColor=white)](https://extensions.gnome.org/extension/10082/true-usb-write-progress/)
+
 ## The Problem
 
 When you copy files to a USB drive on Linux, the file manager often reports the operation as "complete" while the data is still sitting in the kernel's write-back cache. Ejecting the drive at this point can result in data corruption. There is no built-in visual feedback for the actual flush progress.
