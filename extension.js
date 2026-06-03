@@ -31,18 +31,29 @@ const POLL_INTERVAL_SECONDS = 2;
 const NOTIFY_COOLDOWN_MS    = 10_000; // min gap between "safe to eject" toasts
 
 // ── Write-detection thresholds ───────────────────────────────────────────────
-// Metadata writes (journal commits, inode updates, directory entries) are small
-// and infrequent.  Real file copies produce large sustained throughput.
-// We use two criteria to tell them apart:
-//   1. Minimum write rate per tick (bytes written since last poll)
-//   2. Minimum average I/O request size (large = sequential file data)
+//
+// Two-phase detection strategy:
+//
+//   Phase 1 — TRIGGER:  Strict thresholds to START a write burst.
+//     Only large, sustained I/O can trigger the indicator.  This filters out
+//     small metadata writes (journal commits, inode updates, dir entries).
+//
+//   Phase 2 — SUSTAIN:  Once triggered, ANY device write activity (even small)
+//     keeps the indicator alive.  This prevents the indicator from flickering
+//     off between kernel writeback bursts during an active copy.
+//
+//   DONE:  Only when the device is truly idle (zero sector change AND zero
+//     in-flight I/O) for a sustained period do we declare the copy finished.
+
+// Phase 1 thresholds (must pass BOTH to trigger)
 const MIN_WRITE_RATE_BYTES  = 64 * 1024;  // 64 KB per tick (~32 KB/s @2s poll)
 const MIN_AVG_IO_SIZE_BYTES = 16 * 1024;  // 16 KB avg request size
 
-// Once a real write burst is detected, keep the indicator visible for this many
-// consecutive "quiet" ticks before declaring the write finished.  This avoids
-// flicker caused by short pauses between bursts (e.g. between files).
-const QUIET_TICKS_BEFORE_DONE = 3;
+// How many consecutive "truly idle" ticks (no sector change, no in-flight)
+// before declaring the write finished.  Linux writeback is bursty, so we need
+// a generous window to avoid premature "done" between flush rounds.
+// 5 ticks × 2 seconds = 10 second grace period.
+const IDLE_TICKS_BEFORE_DONE = 5;
 
 // UDisks2 well-known names
 const UDISKS2_BUS_NAME  = 'org.freedesktop.UDisks2';
@@ -163,7 +174,8 @@ export default class TrueUsbProgressExtension extends Extension {
         // Per-device state for delta tracking
         // Map<devName, { prevWrites, prevSectors, totalBytesThisBurst }>
         this._devStats         = new Map();
-        this._quietTicks       = 0;   // how many consecutive ticks with no real writes
+        this._idleTicks        = 0;    // consecutive ticks with zero device activity
+        this._lastRateMBs      = '0.0'; // last known write speed for display
 
         this._buildIndicator();
         this._connectUDisks2();
@@ -371,17 +383,19 @@ export default class TrueUsbProgressExtension extends Extension {
     /**
      * Called every POLL_INTERVAL_SECONDS.
      *
-     * Uses per-device sector-write deltas from /sys/block/<dev>/stat to detect
-     * real file writes while ignoring small metadata bursts (journal commits,
-     * inode updates, directory entry changes).
+     * Two-phase write detection:
      *
-     * Detection heuristic:
-     *   1. Compute ΔsectorsWritten and ΔwritesCompleted since last tick
-     *   2. Convert to bytes (sectors × 512)
-     *   3. Only flag as "writing" if:
-     *        • ΔBytes  ≥  MIN_WRITE_RATE_BYTES   (sustained throughput)
-     *        • avgIO   ≥  MIN_AVG_IO_SIZE_BYTES   (large sequential writes)
-     *   4. Use a quiet-tick counter to ride through brief pauses between files
+     *   TRIGGER (Phase 1) — strict thresholds on write rate AND average I/O
+     *     size.  Only large sequential writes (file copies) can start a burst.
+     *     Small metadata writes are ignored.
+     *
+     *   SUSTAIN (Phase 2) — once a burst is active, ANY device write activity
+     *     (even small sector changes or in-flight I/O) keeps the indicator
+     *     alive.  This prevents flickering between kernel writeback rounds.
+     *
+     *   DONE — the indicator hides only after the device is truly idle
+     *     (zero sector changes AND zero in-flight I/O) for
+     *     IDLE_TICKS_BEFORE_DONE consecutive ticks.
      */
     _tick() {
         if (!this._indicator) return;                  // extension disabled mid-tick
@@ -394,7 +408,8 @@ export default class TrueUsbProgressExtension extends Extension {
 
         // ── 1. Per-device delta analysis ───────────────────────────────────
         let totalDeltaBytes = 0;
-        let anyRealWrite    = false;
+        let anyLargeWrite   = false;   // passes Phase 1 thresholds
+        let anyActivity     = false;   // ANY write activity at all
         let anyInFlight     = false;
 
         for (const dev of this._removableDevices) {
@@ -417,58 +432,70 @@ export default class TrueUsbProgressExtension extends Extension {
             const deltaSectors = stats.sectorsWritten  - prev.prevSectors;
             const deltaBytes   = deltaSectors * 512;
 
-            // Update stored state
+            // Update stored counters
             prev.prevWrites  = stats.writesCompleted;
             prev.prevSectors = stats.sectorsWritten;
 
             if (deltaWrites <= 0 || deltaSectors <= 0) continue;
 
+            // Any sector change at all counts as activity
+            anyActivity = true;
+            prev.totalBytesThisBurst += deltaBytes;
+            totalDeltaBytes          += deltaBytes;
+
             const avgIOSize = deltaBytes / deltaWrites;
 
-            // Only consider this a real file write if it exceeds both thresholds
+            // Phase 1: check if this qualifies as a real file write
             if (deltaBytes >= MIN_WRITE_RATE_BYTES &&
                 avgIOSize  >= MIN_AVG_IO_SIZE_BYTES) {
-                anyRealWrite = true;
-                prev.totalBytesThisBurst += deltaBytes;
-                totalDeltaBytes          += deltaBytes;
+                anyLargeWrite = true;
             }
         }
 
-        // ── 2. Decide write state with quiet-tick hysteresis ───────────────
+        // ── 2. Two-phase state machine ─────────────────────────────────────
         //
-        // If a real write is happening right now → reset quiet counter.
-        // If no real write this tick but we were previously writing, increment
-        // the quiet counter.  Only declare "done" after several consecutive
-        // quiet ticks (avoids flicker between files in a batch copy).
-        // Also stay active if there are still in-flight I/Os on the device.
+        //  • NOT writing + large write detected  →  START burst
+        //  • Writing + any activity or in-flight  →  SUSTAIN (reset idle timer)
+        //  • Writing + no activity + no in-flight →  tick idle counter
+        //  • Writing + idle counter exceeded      →  DONE
 
         let isWriting;
-        if (anyRealWrite) {
-            this._quietTicks = 0;
-            isWriting = true;
-        } else if (this._wasWriting && (anyInFlight || this._quietTicks < QUIET_TICKS_BEFORE_DONE)) {
-            this._quietTicks++;
-            isWriting = true;
+
+        if (!this._wasWriting) {
+            // Phase 1: only large writes can start a burst
+            isWriting = anyLargeWrite;
         } else {
-            isWriting = false;
+            // Phase 2: any activity or in-flight I/O keeps us alive
+            if (anyActivity || anyInFlight) {
+                this._idleTicks = 0;
+                isWriting = true;
+            } else {
+                // Device is fully idle this tick
+                this._idleTicks++;
+                isWriting = this._idleTicks < IDLE_TICKS_BEFORE_DONE;
+            }
         }
 
         // ── 3. Update indicator ────────────────────────────────────────────
         if (isWriting) {
-            // Sum up total bytes written across all tracked devices in this burst
+            // Sum total bytes written across all tracked devices in this burst
             let burstTotal = 0;
             for (const [, st] of this._devStats) {
                 burstTotal += st.totalBytesThisBurst;
             }
 
             const writtenMB = (burstTotal / (1024 * 1024)).toFixed(1);
-            const rateMBs   = (totalDeltaBytes / (1024 * 1024) / POLL_INTERVAL_SECONDS).toFixed(1);
 
             if (totalDeltaBytes > 0) {
-                this._label.set_text(`Writing: ${writtenMB} MB (${rateMBs} MB/s)`);
+                // Actively writing — show speed
+                this._lastRateMBs = (totalDeltaBytes / (1024 * 1024) / POLL_INTERVAL_SECONDS).toFixed(1);
+                this._label.set_text(`Writing: ${writtenMB} MB (${this._lastRateMBs} MB/s)`);
+            } else if (anyInFlight) {
+                // Sectors stopped but I/O still completing — final sync
+                this._label.set_text(`Syncing: ${writtenMB} MB written`);
             } else {
-                // In the quiet tail / flushing phase
-                this._label.set_text(`Flushing: ${writtenMB} MB written`);
+                // Brief gap between writeback bursts — keep showing total
+                this._label.set_text(`Writing: ${writtenMB} MB`);
             }
 
             this._indicator.show();
@@ -478,9 +505,10 @@ export default class TrueUsbProgressExtension extends Extension {
 
             // Emit "safe to eject" notification once per completed write burst
             if (this._wasWriting) {
-                this._wasWriting = false;
-                this._quietTicks = 0;
-                // Reset burst counters
+                this._wasWriting   = false;
+                this._idleTicks    = 0;
+                this._lastRateMBs  = '0.0';
+                // Reset burst counters for next copy
                 for (const [, st] of this._devStats) {
                     st.totalBytesThisBurst = 0;
                 }
