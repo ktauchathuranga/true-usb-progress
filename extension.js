@@ -65,16 +65,19 @@ const UDISKS2_FS        = 'org.freedesktop.UDisks2.Filesystem';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+// Promisify Gio.File.load_contents_async for async/await usage
+Gio._promisify(Gio.File.prototype, 'load_contents_async');
+
 /**
- * Read a text file synchronously via GLib.
+ * Read a text file asynchronously via Gio.
  * Returns null on any error so callers can handle gracefully.
  * @param {string} path
- * @returns {string|null}
+ * @returns {Promise<string|null>}
  */
-function readFileSync(path) {
+async function readFileAsync(path) {
     try {
-        const [ok, contents] = GLib.file_get_contents(path);
-        if (!ok) return null;
+        const file = Gio.File.new_for_path(path);
+        const [contents] = await file.load_contents_async(null);
         return new TextDecoder().decode(contents);
     } catch (_) {
         return null;
@@ -122,11 +125,11 @@ function toParentDisk(devName) {
  * ("sda") since /sys/block/ only has whole-disk entries.
  *
  * @param {string} devName  e.g. "sdb1" or "sdb"
- * @returns {{ writesCompleted: number, sectorsWritten: number, inFlight: number }}
+ * @returns {Promise<{ writesCompleted: number, sectorsWritten: number, inFlight: number }>}
  */
-function getBlockWriteStats(devName) {
+async function getBlockWriteStats(devName) {
     const disk = toParentDisk(devName);
-    const text = readFileSync(`/sys/block/${disk}/stat`);
+    const text = await readFileAsync(`/sys/block/${disk}/stat`);
     if (!text) return { writesCompleted: 0, sectorsWritten: 0, inFlight: 0 };
     const f = text.trim().split(/\s+/);
     return {
@@ -231,12 +234,16 @@ export default class TrueUsbProgressExtension extends Extension {
     }
 
     _destroyIndicator() {
+        this._icon?.destroy();
+        this._icon = null;
+
+        this._label?.destroy();
+        this._label = null;
+
         if (this._indicator) {
             this._indicator.destroy();
             this._indicator = null;
         }
-        this._icon  = null;
-        this._label = null;
     }
 
     // ── UDisks2 D-Bus integration ──────────────────────────────────────────
@@ -413,7 +420,7 @@ export default class TrueUsbProgressExtension extends Extension {
      *     IDLE_TICKS_BEFORE_DONE consecutive ticks.  A notification fires
      *     naming only that specific device.
      */
-    _tick() {
+    async _tick() {
         if (!this._indicator) return;                  // extension disabled mid-tick
 
         if (this._removableDevices.size === 0) {
@@ -426,8 +433,12 @@ export default class TrueUsbProgressExtension extends Extension {
 
         // ── 1. Per-device delta analysis + state machine ──────────────────
         for (const [dev, devInfo] of this._removableDevices) {
-            const stats = getBlockWriteStats(dev);
-            let   st    = this._devStats.get(dev);
+            const stats = await getBlockWriteStats(dev);
+
+            // Guard: extension may have been disabled during the async read
+            if (!this._indicator) return;
+
+            let st = this._devStats.get(dev);
 
             if (!st) {
                 // First time seeing this device — store baseline
