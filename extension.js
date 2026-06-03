@@ -165,17 +165,21 @@ export default class TrueUsbProgressExtension extends Extension {
 
     enable() {
         this._removableDevices = new Map();   // Map<devName, { label }>
-        this._wasWriting       = false;
         this._lastNotifyTime   = 0;
         this._pollSourceId     = null;
         this._udisksSignalIds  = [];
         this._dbusConnection   = null;
 
-        // Per-device state for delta tracking
-        // Map<devName, { prevWrites, prevSectors, totalBytesThisBurst }>
+        // Per-device I/O state + write-detection state machine
+        // Map<devName, {
+        //   prevWrites, prevSectors,      — cumulative counters from last tick
+        //   totalBytesThisBurst,          — bytes written in current burst
+        //   deltaBytesThisTick,           — bytes written this tick (for speed)
+        //   wasWriting,                   — is this device in an active burst?
+        //   idleTicks,                    — consecutive idle ticks
+        //   lastRateMBs,                  — last known write speed string
+        // }>
         this._devStats         = new Map();
-        this._idleTicks        = 0;    // consecutive ticks with zero device activity
-        this._lastRateMBs      = '0.0'; // last known write speed for display
 
         this._buildIndicator();
         this._connectUDisks2();
@@ -394,169 +398,149 @@ export default class TrueUsbProgressExtension extends Extension {
     /**
      * Called every POLL_INTERVAL_SECONDS.
      *
-     * Two-phase write detection:
+     * Each USB device runs its own independent two-phase state machine:
      *
      *   TRIGGER (Phase 1) — strict thresholds on write rate AND average I/O
      *     size.  Only large sequential writes (file copies) can start a burst.
      *     Small metadata writes are ignored.
      *
-     *   SUSTAIN (Phase 2) — once a burst is active, ANY device write activity
-     *     (even small sector changes or in-flight I/O) keeps the indicator
-     *     alive.  This prevents flickering between kernel writeback rounds.
+     *   SUSTAIN (Phase 2) — once triggered, ANY device write activity
+     *     (even small sector changes or in-flight I/O) keeps the device's
+     *     indicator alive.  This prevents flickering between writeback rounds.
      *
-     *   DONE — the indicator hides only after the device is truly idle
+     *   DONE — a device's burst ends only after it is truly idle
      *     (zero sector changes AND zero in-flight I/O) for
-     *     IDLE_TICKS_BEFORE_DONE consecutive ticks.
+     *     IDLE_TICKS_BEFORE_DONE consecutive ticks.  A notification fires
+     *     naming only that specific device.
      */
     _tick() {
         if (!this._indicator) return;                  // extension disabled mid-tick
 
-        const hasRemovable = this._removableDevices.size > 0;
-        if (!hasRemovable) {
+        if (this._removableDevices.size === 0) {
             this._indicator.hide();
             return;
         }
 
-        // ── 1. Per-device delta analysis ───────────────────────────────────
-        let totalDeltaBytes = 0;
-        let anyLargeWrite   = false;   // passes Phase 1 thresholds
-        let anyActivity     = false;   // ANY write activity at all
-        let anyInFlight     = false;
+        // Names of devices that just finished their burst this tick
+        const justFinished = [];
 
-        for (const [dev] of this._removableDevices) {
+        // ── 1. Per-device delta analysis + state machine ──────────────────
+        for (const [dev, devInfo] of this._removableDevices) {
             const stats = getBlockWriteStats(dev);
-            const prev  = this._devStats.get(dev);
+            let   st    = this._devStats.get(dev);
 
-            if (stats.inFlight > 0) anyInFlight = true;
-
-            if (!prev) {
-                // First time seeing this device — store baseline, skip delta
-                this._devStats.set(dev, {
+            if (!st) {
+                // First time seeing this device — store baseline
+                st = {
                     prevWrites         : stats.writesCompleted,
                     prevSectors        : stats.sectorsWritten,
                     totalBytesThisBurst: 0,
-                });
+                    deltaBytesThisTick : 0,
+                    wasWriting         : false,
+                    idleTicks          : 0,
+                    lastRateMBs        : '0.0',
+                };
+                this._devStats.set(dev, st);
                 continue;
             }
 
-            const deltaWrites  = stats.writesCompleted - prev.prevWrites;
-            const deltaSectors = stats.sectorsWritten  - prev.prevSectors;
+            const deltaWrites  = stats.writesCompleted - st.prevWrites;
+            const deltaSectors = stats.sectorsWritten  - st.prevSectors;
             const deltaBytes   = deltaSectors * 512;
+            const inFlight     = stats.inFlight > 0;
 
-            // Update stored counters
-            prev.prevWrites  = stats.writesCompleted;
-            prev.prevSectors = stats.sectorsWritten;
+            // Update cumulative counters
+            st.prevWrites  = stats.writesCompleted;
+            st.prevSectors = stats.sectorsWritten;
 
-            if (deltaWrites <= 0 || deltaSectors <= 0) continue;
+            // Classify activity for this device
+            const hasActivity   = deltaWrites > 0 && deltaSectors > 0;
+            const avgIOSize     = hasActivity ? deltaBytes / deltaWrites : 0;
+            const isLargeWrite  = hasActivity &&
+                                  deltaBytes >= MIN_WRITE_RATE_BYTES &&
+                                  avgIOSize  >= MIN_AVG_IO_SIZE_BYTES;
 
-            // Any sector change at all counts as activity
-            anyActivity = true;
-            prev.totalBytesThisBurst += deltaBytes;
-            totalDeltaBytes          += deltaBytes;
+            // Track this tick's delta for speed display
+            st.deltaBytesThisTick = hasActivity ? deltaBytes : 0;
 
-            const avgIOSize = deltaBytes / deltaWrites;
-
-            // Phase 1: check if this qualifies as a real file write
-            if (deltaBytes >= MIN_WRITE_RATE_BYTES &&
-                avgIOSize  >= MIN_AVG_IO_SIZE_BYTES) {
-                anyLargeWrite = true;
+            if (hasActivity) {
+                st.totalBytesThisBurst += deltaBytes;
             }
-        }
 
-        // ── 2. Two-phase state machine ─────────────────────────────────────
-        //
-        //  • NOT writing + large write detected  →  START burst
-        //  • Writing + any activity or in-flight  →  SUSTAIN (reset idle timer)
-        //  • Writing + no activity + no in-flight →  tick idle counter
-        //  • Writing + idle counter exceeded      →  DONE
-
-        let isWriting;
-
-        if (!this._wasWriting) {
-            // Phase 1: only large writes can start a burst
-            isWriting = anyLargeWrite;
-        } else {
-            // Phase 2: any activity or in-flight I/O keeps us alive
-            if (anyActivity || anyInFlight) {
-                this._idleTicks = 0;
-                isWriting = true;
+            // ── Per-device state machine ───────────────────────────────────
+            if (!st.wasWriting) {
+                // Phase 1: only large writes can start a burst
+                if (isLargeWrite) {
+                    st.wasWriting = true;
+                    st.idleTicks  = 0;
+                }
             } else {
-                // Device is fully idle this tick
-                this._idleTicks++;
-                isWriting = this._idleTicks < IDLE_TICKS_BEFORE_DONE;
+                // Phase 2: any activity or in-flight keeps it alive
+                if (hasActivity || inFlight) {
+                    st.idleTicks = 0;
+                } else {
+                    st.idleTicks++;
+                    if (st.idleTicks >= IDLE_TICKS_BEFORE_DONE) {
+                        // This device is DONE
+                        st.wasWriting          = false;
+                        st.idleTicks           = 0;
+                        st.totalBytesThisBurst = 0;
+                        st.lastRateMBs         = '0.0';
+                        justFinished.push(devInfo.label);
+                    }
+                }
+            }
+
+            // Update speed string when we have fresh data
+            if (st.deltaBytesThisTick > 0) {
+                st.lastRateMBs = (st.deltaBytesThisTick / (1024 * 1024) / POLL_INTERVAL_SECONDS).toFixed(1);
             }
         }
 
-        // ── 3. Update indicator ────────────────────────────────────────────
-        if (isWriting) {
-            // Build per-device summary lines
-            const parts = [];
-            let   burstTotal = 0;
+        // ── 2. Fire notifications for any devices that just finished ──────
+        for (const name of justFinished) {
+            this._notifySyncComplete(name);
+        }
 
-            for (const [dev, devInfo] of this._removableDevices) {
-                const st = this._devStats.get(dev);
-                if (!st || st.totalBytesThisBurst <= 0) continue;
+        // ── 3. Build indicator from all devices currently writing ─────────
+        const activeDevices = [];
+        for (const [dev, devInfo] of this._removableDevices) {
+            const st = this._devStats.get(dev);
+            if (!st?.wasWriting) continue;
+            activeDevices.push({ dev, label: devInfo.label, st });
+        }
 
-                burstTotal += st.totalBytesThisBurst;
+        if (activeDevices.length > 0) {
+            const parts = activeDevices.map(({ label, st }) => {
                 const mb = (st.totalBytesThisBurst / (1024 * 1024)).toFixed(1);
-                parts.push(`${devInfo.label}: ${mb} MB`);
-            }
+                if (st.deltaBytesThisTick > 0) {
+                    return `${label}: ${mb} MB (${st.lastRateMBs} MB/s)`;
+                } else {
+                    return `${label}: ${mb} MB`;
+                }
+            });
 
-            // Fallback if no per-device data yet (first tick of burst)
-            if (parts.length === 0) {
-                const anyLabel = [...this._removableDevices.values()][0]?.label ?? 'USB';
-                parts.push(anyLabel);
-            }
-
-            const devSummary = parts.join(' · ');
-
-            if (totalDeltaBytes > 0) {
-                // Actively writing — show speed
-                this._lastRateMBs = (totalDeltaBytes / (1024 * 1024) / POLL_INTERVAL_SECONDS).toFixed(1);
-                this._label.set_text(`${devSummary} (${this._lastRateMBs} MB/s)`);
-            } else if (anyInFlight) {
-                // Sectors stopped but I/O still completing — final sync
-                this._label.set_text(`Syncing: ${devSummary}`);
-            } else {
-                // Brief gap between writeback bursts — keep showing summary
-                this._label.set_text(devSummary);
-            }
-
+            this._label.set_text(parts.join(' · '));
             this._indicator.show();
-            this._wasWriting = true;
         } else {
             this._indicator.hide();
-
-            // Emit "safe to eject" notification once per completed write burst
-            if (this._wasWriting) {
-                this._wasWriting   = false;
-                this._idleTicks    = 0;
-                this._lastRateMBs  = '0.0';
-                // Reset burst counters for next copy
-                for (const [, st] of this._devStats) {
-                    st.totalBytesThisBurst = 0;
-                }
-                this._notifySyncComplete();
-            }
         }
     }
 
     // ── Notification ───────────────────────────────────────────────────────
 
-    _notifySyncComplete() {
+    /**
+     * Notify the user that a specific USB drive has finished syncing.
+     * @param {string} driveName  Human-readable label of the drive
+     */
+    _notifySyncComplete(driveName) {
         const now = GLib.get_monotonic_time() / 1000; // µs → ms
         if (now - this._lastNotifyTime < NOTIFY_COOLDOWN_MS) return;
         this._lastNotifyTime = now;
 
-        // List the USB drive names in the notification
-        const names = [...this._removableDevices.values()]
-            .map(d => d.label)
-            .filter(Boolean);
-        const driveList = names.length > 0 ? names.join(', ') : 'your USB drive';
-
         Main.notify(
             'USB Sync Complete',
-            `Write cache flushed — safe to eject ${driveList}.`,
+            `Write cache flushed — safe to eject ${driveName}.`,
         );
     }
 }
