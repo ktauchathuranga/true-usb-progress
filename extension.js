@@ -164,7 +164,7 @@ export default class TrueUsbProgressExtension extends Extension {
     // ── Lifecycle ──────────────────────────────────────────────────────────
 
     enable() {
-        this._removableDevices = new Set();   // set of dev names e.g. "sdb"
+        this._removableDevices = new Map();   // Map<devName, { label }>
         this._wasWriting       = false;
         this._lastNotifyTime   = 0;
         this._pollSourceId     = null;
@@ -314,18 +314,24 @@ export default class TrueUsbProgressExtension extends Extension {
      *   1. Does it have a Block interface with a Drive property?
      *   2. Is that Drive removable with ConnectionBus == "usb"?
      *   3. Does it have a Filesystem interface (i.e. is it mounted)?
-     * If all true → add its device name to _removableDevices.
+     * If all true → add to _removableDevices with a human-readable label.
+     *
+     * Label priority:  filesystem label (IdLabel) → drive model → dev name.
      */
     _processUDisks2Objects(objects) {
-        // Build a drive-path → removable+usb map first
-        const driveIsUsb = {};
+        // Build a drive-path → { isUsb, model } map first
+        const driveInfo = {};
         for (const [objPath, ifaces] of Object.entries(objects)) {
             if (!objPath.startsWith('/org/freedesktop/UDisks2/drives/')) continue;
             const driveIface = ifaces[UDISKS2_DRIVE];
             if (!driveIface) continue;
             const removable      = driveIface['Removable']?.deep_unpack()      ?? false;
             const connectionBus  = driveIface['ConnectionBus']?.deep_unpack()  ?? '';
-            driveIsUsb[objPath]  = removable && connectionBus === 'usb';
+            const model          = driveIface['Model']?.deep_unpack()          ?? '';
+            driveInfo[objPath]   = {
+                isUsb : removable && connectionBus === 'usb',
+                model : model.trim(),
+            };
         }
 
         // Now check block devices
@@ -335,7 +341,8 @@ export default class TrueUsbProgressExtension extends Extension {
             if (!blockIface) continue;
 
             const drivePath = blockIface['Drive']?.deep_unpack() ?? '/';
-            if (!driveIsUsb[drivePath]) continue;
+            const info      = driveInfo[drivePath];
+            if (!info?.isUsb) continue;
 
             // Must have a Filesystem interface (partitions without mounts are ignored)
             if (!ifaces[UDISKS2_FS]) continue;
@@ -343,10 +350,14 @@ export default class TrueUsbProgressExtension extends Extension {
             const devVariant = blockIface['Device'];
             if (!devVariant) continue;
             const devName = devicePathToName(devVariant);
-            if (devName) {
-                this._removableDevices.add(devName);
-                log(`[TrueUsbProgress] Tracking removable USB device: /dev/${devName}`);
-            }
+            if (!devName) continue;
+
+            // Pick the best human-readable label
+            const fsLabel = blockIface['IdLabel']?.deep_unpack()?.trim() ?? '';
+            const label   = fsLabel || info.model || devName;
+
+            this._removableDevices.set(devName, { label });
+            log(`[TrueUsbProgress] Tracking USB device: /dev/${devName} ("${label}")`);
         }
     }
 
@@ -412,7 +423,7 @@ export default class TrueUsbProgressExtension extends Extension {
         let anyActivity     = false;   // ANY write activity at all
         let anyInFlight     = false;
 
-        for (const dev of this._removableDevices) {
+        for (const [dev] of this._removableDevices) {
             const stats = getBlockWriteStats(dev);
             const prev  = this._devStats.get(dev);
 
@@ -478,24 +489,37 @@ export default class TrueUsbProgressExtension extends Extension {
 
         // ── 3. Update indicator ────────────────────────────────────────────
         if (isWriting) {
-            // Sum total bytes written across all tracked devices in this burst
-            let burstTotal = 0;
-            for (const [, st] of this._devStats) {
+            // Build per-device summary lines
+            const parts = [];
+            let   burstTotal = 0;
+
+            for (const [dev, devInfo] of this._removableDevices) {
+                const st = this._devStats.get(dev);
+                if (!st || st.totalBytesThisBurst <= 0) continue;
+
                 burstTotal += st.totalBytesThisBurst;
+                const mb = (st.totalBytesThisBurst / (1024 * 1024)).toFixed(1);
+                parts.push(`${devInfo.label}: ${mb} MB`);
             }
 
-            const writtenMB = (burstTotal / (1024 * 1024)).toFixed(1);
+            // Fallback if no per-device data yet (first tick of burst)
+            if (parts.length === 0) {
+                const anyLabel = [...this._removableDevices.values()][0]?.label ?? 'USB';
+                parts.push(anyLabel);
+            }
+
+            const devSummary = parts.join(' · ');
 
             if (totalDeltaBytes > 0) {
                 // Actively writing — show speed
                 this._lastRateMBs = (totalDeltaBytes / (1024 * 1024) / POLL_INTERVAL_SECONDS).toFixed(1);
-                this._label.set_text(`Writing: ${writtenMB} MB (${this._lastRateMBs} MB/s)`);
+                this._label.set_text(`${devSummary} (${this._lastRateMBs} MB/s)`);
             } else if (anyInFlight) {
                 // Sectors stopped but I/O still completing — final sync
-                this._label.set_text(`Syncing: ${writtenMB} MB written`);
+                this._label.set_text(`Syncing: ${devSummary}`);
             } else {
-                // Brief gap between writeback bursts — keep showing total
-                this._label.set_text(`Writing: ${writtenMB} MB`);
+                // Brief gap between writeback bursts — keep showing summary
+                this._label.set_text(devSummary);
             }
 
             this._indicator.show();
@@ -524,9 +548,15 @@ export default class TrueUsbProgressExtension extends Extension {
         if (now - this._lastNotifyTime < NOTIFY_COOLDOWN_MS) return;
         this._lastNotifyTime = now;
 
+        // List the USB drive names in the notification
+        const names = [...this._removableDevices.values()]
+            .map(d => d.label)
+            .filter(Boolean);
+        const driveList = names.length > 0 ? names.join(', ') : 'your USB drive';
+
         Main.notify(
             'USB Sync Complete',
-            'Write cache flushed — safe to eject your USB drive.',
+            `Write cache flushed — safe to eject ${driveList}.`,
         );
     }
 }
