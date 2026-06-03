@@ -4,7 +4,7 @@
   "name": "True USB Write Progress",
   "description": "A top-bar widget that monitors real-time pending background writes to removable USB storage, showing true dirty-cache flush progress so you know exactly when a drive is safe to eject.",
   "shell-version": ["45", "46", "47", "48", "49", "50"],
-  "version": 1,
+  "version": 2,
   "url": "https://github.com/ktauchathuranga/true-usb-progress",
   "settings-schema": "",
   "gettext-domain": "true-usb-progress"
