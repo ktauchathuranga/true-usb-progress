@@ -31,6 +31,9 @@ Uses ESM imports (`gi://`). No legacy `imports.gi` compatibility.
 # Clone the repository
 git clone https://github.com/ktauchathuranga/true-usb-progress.git
 
+# Enter the cloned repository
+cd true-usb-progress
+
 # Create the extension directory
 mkdir -p ~/.local/share/gnome-shell/extensions/true-usb-progress@ktauchathuranga.github.io
 
