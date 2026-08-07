@@ -14,6 +14,12 @@
  *  • PanelMenu.Button → hidden when idle, visible when writing
  *
  * GNOME 45 / 46 + (ESM – no legacy imports.gi)
+ *
+ * Fork addition: reads Filesystem.MountPoints and watches the mount with
+ * Gio.FileMonitor to learn the target file's (often preallocated) final
+ * size, so we can show a real percentage/progress bar instead of just
+ * "N MB written". Falls back to the original text-only display when no
+ * target size can be determined.
  */
 
 import GLib     from 'gi://GLib';
@@ -54,6 +60,13 @@ const MIN_AVG_IO_SIZE_BYTES = 16 * 1024;  // 16 KB avg request size
 // a generous window to avoid premature "done" between flush rounds.
 // 5 ticks × 2 seconds = 10 second grace period.
 const IDLE_TICKS_BEFORE_DONE = 5;
+
+// Fork addition: ignore files smaller than this when looking for the
+// "target" transfer file, to avoid locking onto thumbnails/lockfiles/etc.
+const MIN_TARGET_FILE_SIZE_BYTES = 20 * 1024 * 1024; // 20 MB
+
+// Fork addition: fixed width (px) of the graphical progress bar in the panel.
+const BAR_WIDTH_PX = 80;
 
 // UDisks2 well-known names
 const UDISKS2_BUS_NAME  = 'org.freedesktop.UDisks2';
@@ -160,6 +173,29 @@ function devicePathToName(byteArrayVariant) {
     }
 }
 
+// Fork addition: Filesystem.MountPoints is 'aay' (array of byte arrays).
+// Returns the first decoded mount point, or null if not mounted.
+function firstMountPoint(mountPointsVariant) {
+    try {
+        const arr = mountPointsVariant.deep_unpack();
+        if (!arr || arr.length === 0) return null;
+        const first = arr[0];
+        // GJS may hand back elements as raw Uint8Array or as GVariant
+        // depending on version — handle both.
+        if (first instanceof Uint8Array) {
+            let end = first.length;
+            while (end > 0 && first[end - 1] === 0) end--;
+            return new TextDecoder().decode(first.subarray(0, end));
+        }
+        const bytes = first.deep_unpack();
+        let end = bytes.length;
+        while (end > 0 && bytes[end - 1] === 0) end--;
+        return new TextDecoder().decode(bytes.subarray(0, end));
+    } catch (_) {
+        return null;
+    }
+}
+
 // ─── Main Extension Class ─────────────────────────────────────────────────────
 
 export default class TrueUsbProgressExtension extends Extension {
@@ -184,6 +220,11 @@ export default class TrueUsbProgressExtension extends Extension {
         // }>
         this._devStats         = new Map();
 
+        // Fork addition: one Gio.FileMonitor per watched mount point, used
+        // to detect the transfer's target file and its final size.
+        this._fileMonitors      = new Map(); // Map<devName, Gio.FileMonitor>
+        this._fileMonitorSigIds = new Map(); // Map<devName, signal id>
+
         this._buildIndicator();
         this._connectUDisks2();
         this._startPolling();
@@ -192,6 +233,7 @@ export default class TrueUsbProgressExtension extends Extension {
     disable() {
         this._stopPolling();
         this._disconnectUDisks2();
+        this._clearAllFileMonitors();
         this._destroyIndicator();
 
         this._removableDevices = null;
@@ -223,7 +265,22 @@ export default class TrueUsbProgressExtension extends Extension {
             style       : 'margin-left: 4px; font-weight: bold;',
         });
 
+        // Fork addition: graphical progress bar, shown only when at least
+        // one active device has a known target size.
+        this._barBg = new St.Widget({
+            style: `width: ${BAR_WIDTH_PX}px; height: 8px; border-radius: 4px;
+                    background-color: rgba(255,255,255,0.15); margin-left: 6px;`,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        this._barFill = new St.Widget({
+            style: `width: 0px; height: 8px; border-radius: 4px;
+                    background-color: #3584e4;`,
+        });
+        this._barBg.add_child(this._barFill);
+        this._barBg.hide();
+
         box.add_child(this._icon);
+        box.add_child(this._barBg);
         box.add_child(this._label);
         this._indicator.add_child(box);
 
@@ -236,6 +293,10 @@ export default class TrueUsbProgressExtension extends Extension {
     _destroyIndicator() {
         this._icon?.destroy();
         this._icon = null;
+
+        this._barFill = null; // child of _barBg, destroyed with it
+        this._barBg?.destroy();
+        this._barBg = null;
 
         this._label?.destroy();
         this._label = null;
@@ -328,6 +389,9 @@ export default class TrueUsbProgressExtension extends Extension {
      * If all true → add to _removableDevices with a human-readable label.
      *
      * Label priority:  filesystem label (IdLabel) → drive model → dev name.
+     *
+     * Fork addition: also reads Filesystem.MountPoints and reconciles the
+     * per-device Gio.FileMonitor set accordingly.
      */
     _processUDisks2Objects(objects) {
         // Build a drive-path → { isUsb, model } map first
@@ -346,7 +410,7 @@ export default class TrueUsbProgressExtension extends Extension {
         }
 
         // Now check block devices
-        this._removableDevices.clear();
+        const newDevices = new Map();
         for (const [, ifaces] of Object.entries(objects)) {
             const blockIface = ifaces[UDISKS2_BLOCK];
             if (!blockIface) continue;
@@ -356,7 +420,8 @@ export default class TrueUsbProgressExtension extends Extension {
             if (!info?.isUsb) continue;
 
             // Must have a Filesystem interface (partitions without mounts are ignored)
-            if (!ifaces[UDISKS2_FS]) continue;
+            const fsIface = ifaces[UDISKS2_FS];
+            if (!fsIface) continue;
 
             const devVariant = blockIface['Device'];
             if (!devVariant) continue;
@@ -367,9 +432,27 @@ export default class TrueUsbProgressExtension extends Extension {
             const fsLabel = blockIface['IdLabel']?.deep_unpack()?.trim() ?? '';
             const label   = fsLabel || info.model || devName;
 
-            this._removableDevices.set(devName, { label });
-            log(`[TrueUsbProgress] Tracking USB device: /dev/${devName} ("${label}")`);
+            const mountPoint = fsIface['MountPoints']
+                ? firstMountPoint(fsIface['MountPoints'])
+                : null;
+
+            // Keep any in-progress target info across re-enumerations, so an
+            // unrelated InterfacesAdded/Removed event (e.g. another drive
+            // plugged in) doesn't reset a transfer already being tracked.
+            const prev = this._removableDevices.get(devName);
+
+            newDevices.set(devName, {
+                label,
+                mountPoint,
+                targetFile : prev?.targetFile ?? null,
+                targetSize : prev?.targetSize ?? 0,
+            });
+
+            log(`[TrueUsbProgress] Tracking USB device: /dev/${devName} ("${label}") mount=${mountPoint}`);
         }
+
+        this._removableDevices = newDevices;
+        this._reconcileFileMonitors();
     }
 
     /** UDisks2 InterfacesAdded — re-enumerate so we pick up new mounts */
@@ -380,6 +463,80 @@ export default class TrueUsbProgressExtension extends Extension {
     /** UDisks2 InterfacesRemoved — re-enumerate so we drop unmounted devices */
     _onInterfacesRemoved(_conn, _sender, _objPath, _iface, _signal, _params) {
         this._enumerateUDisks2Objects();
+    }
+
+    // ── Fork addition: file monitoring for target-size detection ────────────
+
+    // Keep exactly one Gio.FileMonitor per currently-tracked device that has
+    // a known mount point, and none for devices no longer present.
+    _reconcileFileMonitors() {
+        if (!this._removableDevices) return;
+
+        for (const devName of [...this._fileMonitors.keys()]) {
+            if (!this._removableDevices.has(devName))
+                this._removeFileMonitor(devName);
+        }
+
+        for (const [devName, info] of this._removableDevices) {
+            if (!info.mountPoint) continue;
+            if (this._fileMonitors.has(devName)) continue;
+            this._addFileMonitor(devName, info.mountPoint);
+        }
+    }
+
+    _addFileMonitor(devName, mountPoint) {
+        try {
+            const dir = Gio.File.new_for_path(mountPoint);
+            const monitor = dir.monitor_directory(Gio.FileMonitorFlags.NONE, null);
+            const sigId = monitor.connect('changed', (_mon, file, _other, eventType) => {
+                this._onFileEvent(devName, file, eventType);
+            });
+            this._fileMonitors.set(devName, monitor);
+            this._fileMonitorSigIds.set(devName, sigId);
+        } catch (e) {
+            logError(e, `[TrueUsbProgress] Could not watch ${mountPoint}`);
+        }
+    }
+
+    _removeFileMonitor(devName) {
+        const monitor = this._fileMonitors.get(devName);
+        if (monitor) {
+            const sigId = this._fileMonitorSigIds.get(devName);
+            if (sigId) monitor.disconnect(sigId);
+            monitor.cancel();
+        }
+        this._fileMonitors.delete(devName);
+        this._fileMonitorSigIds.delete(devName);
+    }
+
+    _clearAllFileMonitors() {
+        for (const devName of [...this._fileMonitors.keys()])
+            this._removeFileMonitor(devName);
+    }
+
+    // When a large-enough new file appears on a watched mount, treat it as
+    // the transfer's target and read its (often preallocated) final size.
+    _onFileEvent(devName, file, eventType) {
+        if (eventType !== Gio.FileMonitorEvent.CREATED &&
+            eventType !== Gio.FileMonitorEvent.CHANGES_DONE_HINT)
+            return;
+
+        if (!this._removableDevices?.has(devName)) return;
+
+        try {
+            const info = file.query_info('standard::size,standard::type',
+                Gio.FileQueryInfoFlags.NONE, null);
+            if (info.get_file_type() !== Gio.FileType.REGULAR) return;
+
+            const size = info.get_size();
+            if (size < MIN_TARGET_FILE_SIZE_BYTES) return;
+
+            const devInfo = this._removableDevices.get(devName);
+            devInfo.targetFile = file.get_path();
+            devInfo.targetSize = size;
+        } catch (_) {
+            // file may have vanished/renamed between the event and the query
+        }
     }
 
     // ── Polling ────────────────────────────────────────────────────────────
@@ -412,8 +569,8 @@ export default class TrueUsbProgressExtension extends Extension {
      *     Small metadata writes are ignored.
      *
      *   SUSTAIN (Phase 2) — once triggered, ANY device write activity
-     *     (even small sector changes or in-flight I/O) keeps the device's
-     *     indicator alive.  This prevents flickering between writeback rounds.
+     *     (even small) keeps the device's indicator alive.  This prevents
+     *     flickering between writeback bursts during an active copy.
      *
      *   DONE — a device's burst ends only after it is truly idle
      *     (zero sector changes AND zero in-flight I/O) for
@@ -497,6 +654,10 @@ export default class TrueUsbProgressExtension extends Extension {
                         st.idleTicks           = 0;
                         st.totalBytesThisBurst = 0;
                         st.lastRateMBs         = '0.0';
+                        // Fork addition: clear target too, so the next
+                        // detected file starts a fresh transfer.
+                        devInfo.targetFile = null;
+                        devInfo.targetSize = 0;
                         justFinished.push(devInfo.label);
                     }
                 }
@@ -518,22 +679,43 @@ export default class TrueUsbProgressExtension extends Extension {
         for (const [dev, devInfo] of this._removableDevices) {
             const st = this._devStats.get(dev);
             if (!st?.wasWriting) continue;
-            activeDevices.push({ dev, label: devInfo.label, st });
+            activeDevices.push({ dev, devInfo, st });
         }
 
         if (activeDevices.length > 0) {
-            const parts = activeDevices.map(({ label, st }) => {
+            // Fork addition: include a percentage when target size is known,
+            // otherwise fall back to the original "MB (rate)" text.
+            const parts = activeDevices.map(({ devInfo, st }) => {
                 const mb = (st.totalBytesThisBurst / (1024 * 1024)).toFixed(1);
-                if (st.deltaBytesThisTick > 0) {
-                    return `${label}: ${mb} MB (${st.lastRateMBs} MB/s)`;
-                } else {
-                    return `${label}: ${mb} MB`;
+                const rateSuffix = st.deltaBytesThisTick > 0 ? ` (${st.lastRateMBs} MB/s)` : '';
+
+                if (devInfo.targetSize > 0) {
+                    const fraction = Math.max(0, Math.min(1, st.totalBytesThisBurst / devInfo.targetSize));
+                    const pct = Math.round(fraction * 100);
+                    const totalMb = (devInfo.targetSize / (1024 * 1024)).toFixed(0);
+                    return { text: `${devInfo.label}: ${pct}% · ${mb}/${totalMb} MB${rateSuffix}`, fraction };
                 }
+                return { text: `${devInfo.label}: ${mb} MB${rateSuffix}`, fraction: null };
             });
 
-            this._label.set_text(parts.join(' · '));
+            this._label.set_text(parts.map(p => p.text).join(' · '));
+
+            // Fork addition: graphical bar reflects the highest-known
+            // fraction among active devices; hidden if none is known.
+            const known = parts.filter(p => p.fraction !== null);
+            if (known.length > 0) {
+                const best = known.reduce((a, b) => (b.fraction > a.fraction ? b : a));
+                this._barFill.set_style(
+                    `width: ${Math.round(BAR_WIDTH_PX * best.fraction)}px; height: 8px;
+                     border-radius: 4px; background-color: #3584e4;`);
+                this._barBg.show();
+            } else {
+                this._barBg.hide();
+            }
+
             this._indicator.show();
         } else {
+            this._barBg.hide();
             this._indicator.hide();
         }
     }
